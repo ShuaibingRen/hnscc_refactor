@@ -1,0 +1,57 @@
+# Default configuration for HNSCC pipeline
+
+# Input settings
+input:
+  file_pattern: "{sample}_{cycle}_w{channel}_s{fov}_t1.TIF"
+  channels_per_cycle: 4
+  exclude_overview: true  # Exclude last FOV (overview image)
+
+grid:
+  rows: 6
+  cols: 5
+
+
+# Illumination correction
+illumination:
+  mode: simple  # 'simple' or 'hnscc'
+  mi_threshold: 0.10  # Mutual information threshold for HNSCC mode
+  min_fov_count: 60   # Minimum FOV count for sample to be included in averaging
+  max_iterations: 800
+  darkfield: true
+  smoothness_flatfield: 1.0
+
+# Alignment
+alignment:
+  scale: 0.1  # Downscale factor for alignment (speed optimization)
+  mean_threshold: 200  # Minimum mean intensity threshold
+  overlap_threshold: 0.2  # Minimum overlap ratio after alignment
+  reference_channel: 1  # w1 (DAPI) as reference
+  max_iterations: 5000
+  epsilon: 1e-10
+  on_failure: skip  # 'skip' = drop failed tiles, 'copy' = keep unaligned tiles
+
+# Quench subtraction
+subtraction:
+  mode: simple  # 'simple' or 'mi_optimized'
+  coeff_range: [0.6, 2.0]  # Coefficient range for MI optimization
+  coeff_steps: 50  # Number of steps in coefficient search
+  polynomial_degree: 5  # Degree for polynomial fitting
+
+# Stitching (ASHLAR)
+stitching:
+  overlap: 0.1
+  layout: raster      # 'snake' or 'raster' - must match scan acquisition pattern
+  direction: vertical  # 'horizontal' or 'vertical' - must match scan direction
+  align_channel: 0    # DAPI channel for alignment
+  pixel_size: 0.325   # µm per pixel
+  output_format: ome-tiff
+
+# Performance
+performance:
+  max_workers: null  # null = use all available CPUs
+  chunk_size: 1000  # MB per chunk for large images
+
+# Output
+output:
+  save_intermediate: true
+  compress: true

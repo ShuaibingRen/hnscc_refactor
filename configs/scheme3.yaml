@@ -1,0 +1,12 @@
+# 方案3: Flat Only, Optimized Alpha (推荐)
+
+alignment:
+  mean_threshold: 0
+  overlap_threshold: 0
+  on_failure: copy
+
+illumination:
+  darkfield: false  # 关键差异：关闭暗场
+
+subtraction:
+  mode: mi_optimized

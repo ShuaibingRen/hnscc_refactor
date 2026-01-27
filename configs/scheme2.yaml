@@ -1,0 +1,12 @@
+# 方案2: Flat + Dark, Optimized Alpha
+
+alignment:
+  mean_threshold: 0
+  overlap_threshold: 0
+  on_failure: copy
+
+illumination:
+  darkfield: true
+
+subtraction:
+  mode: mi_optimized

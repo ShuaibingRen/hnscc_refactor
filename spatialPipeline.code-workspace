@@ -1,0 +1,11 @@
+{
+	"folders": [
+		{
+			"path": ".."
+		},
+		{
+			"path": "../../../../mnt/efs/fs1/aws_home/shuaibing"
+		}
+	],
+	"settings": {}
+}

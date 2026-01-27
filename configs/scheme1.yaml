@@ -1,0 +1,12 @@
+# 方案1: Flat + Dark, Simple Subtraction (Alpha=1)
+
+alignment:
+  mean_threshold: 0
+  overlap_threshold: 0
+  on_failure: copy
+
+illumination:
+  darkfield: true
+
+subtraction:
+  mode: simple
