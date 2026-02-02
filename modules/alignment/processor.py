@@ -44,6 +44,8 @@ def _ecc_align(ref_img: np.ndarray, moving_img: np.ndarray,
     warp_matrix = np.eye(2, 3, dtype=np.float32)
     
     # ECC criteria
+    # IMPORTANT: epsilon must be float, not string (config parser may return string)
+    epsilon = float(epsilon)
     criteria = (cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, max_iterations, epsilon)
     
     try:
@@ -94,6 +96,28 @@ def _compute_overlap_ratio(warp_matrix: np.ndarray, img_shape: Tuple[int, int]) 
     overlap_h = max(0, h - ty)
     
     return (overlap_w * overlap_h) / (w * h)
+
+
+def _phase_correlate_align(ref_img: np.ndarray, moving_img: np.ndarray,
+                           min_response: float = 0.3) -> Tuple[np.ndarray, bool, float]:
+    """
+    Phase Correlation alignment (translation only, robust to large shifts).
+    
+    Args:
+        ref_img: Reference image
+        moving_img: Image to align
+        min_response: Minimum response threshold for success
+        
+    Returns:
+        (warp_matrix, success, response)
+    """
+    (dx, dy), response = cv2.phaseCorrelate(
+        ref_img.astype(np.float32),
+        moving_img.astype(np.float32)
+    )
+    
+    warp_matrix = np.array([[1, 0, dx], [0, 1, dy]], dtype=np.float32)
+    return warp_matrix, response >= min_response, response
 
 
 def _crop_to_overlap(images: List[np.ndarray], 
@@ -154,9 +178,24 @@ class AlignmentProcessor(BaseProcessor):
         self.max_iterations = config.get('alignment.max_iterations', 5000)
         self.epsilon = config.get('alignment.epsilon', 1e-10)
         self.channels_per_cycle = config.get('input.channels_per_cycle', 4)
-        # on_failure: 'skip' (default) or 'copy' (save unaligned)
-        self.on_failure = config.get('alignment.on_failure', 'skip')
+        # Phase Correlation fallback
+        self.pc_fallback = config.get('alignment.pc_fallback', True)
+        self.pc_min_response = config.get('alignment.pc_min_response', 0.3)
+        # on_failure: 'zero' (default) or 'copy'
+        self.on_failure = config.get('alignment.on_failure', 'zero')
+        # Logging
+        self.verbose = config.get('alignment.verbose', False)
+        # Crop settings
+        self.crop_margin = config.get('alignment.crop_margin', 50)
+        self.tile_overlap = config.get('alignment.tile_overlap', 0.1)
+        # Parallel processing
+        self.max_workers = config.get('performance.max_workers', 24)
+        # Runtime state
+        self._collected_matrices: Dict[int, Dict[str, np.ndarray]] = {}
+        self._img_shape: Tuple[int, int] = None
+        self._alignment_report = {'aligned_ecc': 0, 'aligned_pc': 0, 'failed': 0, 'failed_fovs': []}
     
+
     def process(self, input_dir: Path, output_dir: Path, 
                 reference_cycle: str = 'cycle0', **kwargs) -> Dict[str, Any]:
         """
@@ -200,21 +239,47 @@ class AlignmentProcessor(BaseProcessor):
         ref_dapi_dict = {parse_filename(f.name)['fov']: f for f in ref_dapi_files 
                          if parse_filename(f.name)}
         
-        # Process each directory
+        # Process each directory with ThreadPoolExecutor
+        from concurrent.futures import ThreadPoolExecutor
+        
         results = {'aligned': 0, 'skipped_intensity': 0, 'skipped_overlap': 0, 'failed': 0}
         
         for dir_name, dir_path in all_dirs.items():
+            if dir_name == reference_cycle:
+                # Copy reference cycle without alignment
+                dst_dir = self._ensure_dir(output_dir / dir_name)
+                for f in dir_path.glob('*.TIF'):
+                    img = cv2.imread(str(f), cv2.IMREAD_ANYDEPTH)
+                    if img is not None:
+                        Image.fromarray(img).save(str(dst_dir / f.name))
+                        if self._img_shape is None:
+                            self._img_shape = img.shape
+                continue
+            
             self._align_directory(
                 dir_path, output_dir / dir_name,
                 ref_dapi_dict, reference_cycle, dir_name, results
             )
+        
+        # Apply final crop to all aligned images
+        self._apply_final_crop(output_dir)
+        
+        # Save alignment report
+        import json
+        report_path = output_dir / 'alignment_report.json'
+        with open(report_path, 'w') as f:
+            json.dump(self._alignment_report, f, indent=2)
+        self.logger.info(f"Alignment report: {self._alignment_report['aligned_ecc']} ECC, "
+                        f"{self._alignment_report['aligned_pc']} PC, "
+                        f"{self._alignment_report['failed']} failed")
         
         self._log_complete("Image Alignment", output_dir, results)
         
         return {
             'status': 'success',
             'reference_cycle': reference_cycle,
-            'stats': results
+            'stats': results,
+            'alignment_report': self._alignment_report
         }
     
     def _align_directory(self, src_dir: Path, dst_dir: Path,
@@ -283,50 +348,111 @@ class AlignmentProcessor(BaseProcessor):
                 results['aligned'] += 1
                 continue
             
-            # Align
-            _, warp_matrix, success = _ecc_align(
+            # DEBUG: Log image characteristics
+            self.logger.debug(f"FOV {fov} {current_name}: ref shape={ref_img.shape} mean={ref_img.mean():.1f}, mov mean={moving_dapi.mean():.1f}, scale={self.scale}")
+
+            # Align with ECC
+            _, warp_matrix, ecc_success = _ecc_align(
                 ref_img, moving_dapi, 
                 scale=self.scale,
                 max_iterations=self.max_iterations,
                 epsilon=self.epsilon
             )
             
-            if not success:
-                self.logger.warning(f"FOV {fov} failed: ECC alignment did not converge for {current_name}")
+            align_method = 'ECC'
+            if not ecc_success:
+                if self.pc_fallback:
+                    # Try Phase Correlation fallback
+                    warp_matrix, pc_success, pc_response = _phase_correlate_align(
+                        ref_img, moving_dapi, self.pc_min_response
+                    )
+                    if pc_success:
+                        align_method = 'PC'
+                        self._alignment_report['aligned_pc'] += 1
+                        tx, ty = warp_matrix[0, 2], warp_matrix[1, 2]
+                        self.logger.info(f"FOV {fov} {current_name}: ECC failed, PC fallback (tx={tx:.1f}, ty={ty:.1f}, response={pc_response:.2f})")
+                    else:
+                        # Both failed
+                        self.logger.warning(f"FOV {fov} {current_name}: ECC+PC failed (response={pc_response:.2f}), outputting {'zeros' if self.on_failure == 'zero' else 'copy'}")
+                        self._alignment_report['failed'] += 1
+                        self._alignment_report['failed_fovs'].append({'fov': fov, 'cycle': current_name})
+                        results['failed'] += 1
+                        if self.on_failure == 'zero':
+                            self._output_zeros(files, dst_dir)
+                        else:
+                            self._copy_files(files, dst_dir)
+                        continue
+                else:
+                    # No fallback
+                    self.logger.warning(f"FOV {fov} {current_name}: ECC failed, outputting {'zeros' if self.on_failure == 'zero' else 'copy'}")
+                    self._alignment_report['failed'] += 1
+                    self._alignment_report['failed_fovs'].append({'fov': fov, 'cycle': current_name})
+                    results['failed'] += 1
+                    if self.on_failure == 'zero':
+                        self._output_zeros(files, dst_dir)
+                    else:
+                        self._copy_files(files, dst_dir)
+                    continue
+            else:
+                self._alignment_report['aligned_ecc'] += 1
+            
+            # QC: Check overlap ratio (DEPRECATED: now covered by shift magnitude check)
+            # overlap = _compute_overlap_ratio(warp_matrix, ref_img.shape)
+            # if overlap < self.overlap_threshold:
+            #     self.logger.warning(f"FOV {fov} {current_name}: Overlap {overlap:.2f} < {self.overlap_threshold}, outputting zeros")
+            #     self._alignment_report['failed'] += 1
+            #     self._alignment_report['failed_fovs'].append({'fov': fov, 'cycle': current_name, 'reason': f'overlap {overlap:.2f}'})
+            #     results['skipped_overlap'] += 1
+            #     if self.on_failure == 'zero':
+            #         self._output_zeros(files, dst_dir)
+            #     else:
+            #         self._copy_files(files, dst_dir)
+            #     continue
+            
+            # QC: Check shift magnitude (must be within tile_overlap to ensure valid crop)
+            tx, ty = warp_matrix[0, 2], warp_matrix[1, 2]
+            h, w = ref_img.shape
+            max_shift_px = self.tile_overlap * min(h, w)
+            if abs(tx) > max_shift_px or abs(ty) > max_shift_px:
+                self.logger.warning(f"FOV {fov} {current_name}: shift ({tx:.1f}, {ty:.1f}) exceeds {max_shift_px:.0f}px, outputting zeros")
+                self._alignment_report['failed'] += 1
+                self._alignment_report['failed_fovs'].append({'fov': fov, 'cycle': current_name, 'reason': f'shift ({tx:.1f}, {ty:.1f}) > {max_shift_px:.0f}px'})
                 results['failed'] += 1
-                if self.on_failure == 'copy':
+                if self.on_failure == 'zero':
+                    self._output_zeros(files, dst_dir)
+                else:
                     self._copy_files(files, dst_dir)
-                    results['aligned'] += 1
                 continue
             
-            # QC: Check overlap ratio
-            overlap = _compute_overlap_ratio(warp_matrix, ref_img.shape)
-            if overlap < self.overlap_threshold:
-                self.logger.warning(f"FOV {fov} skipped: Overlap ratio {overlap:.2f} < {self.overlap_threshold}")
-                results['skipped_overlap'] += 1
-                if self.on_failure == 'copy':
-                    self._copy_files(files, dst_dir)
-                    results['aligned'] += 1
-                continue
+            # Record matrix for final crop calculation
+            self._collected_matrices.setdefault(fov, {})[current_name] = warp_matrix.copy()
+            if self._img_shape is None:
+                self._img_shape = ref_img.shape
             
-            # Apply transformation to all channels
-            for f in files:
+            # Apply transformation to all channels (parallel I/O)
+            from concurrent.futures import ThreadPoolExecutor
+            
+            def apply_warp(f):
                 img = cv2.imread(str(f), cv2.IMREAD_ANYDEPTH)
                 if img is None:
-                    continue
-                
+                    return
                 h, w = img.shape
                 aligned = cv2.warpAffine(
                     img.astype(np.float32), warp_matrix, (w, h),
                     flags=cv2.INTER_LINEAR + cv2.WARP_INVERSE_MAP,
                     borderMode=cv2.BORDER_CONSTANT, borderValue=0
                 )
-                
-                # Save
                 Image.fromarray(aligned.astype(np.uint16)).save(str(dst_dir / f.name))
-                # Count will be incremented once per FOV at end of loop? No, results is per image?
-                # The logic above increments 'aligned' per FOV for copy, but here we are in loop.
-                # Let's fix counter logic.
+            
+            with ThreadPoolExecutor(max_workers=self.max_workers) as pool:
+                list(pool.map(apply_warp, files))
+            
+            # Log warp matrix (tx, ty, rotation) if verbose
+            if self.verbose:
+                tx, ty = warp_matrix[0, 2], warp_matrix[1, 2]
+                rotation_rad = np.arctan2(warp_matrix[1, 0], warp_matrix[0, 0])
+                rotation_deg = np.degrees(rotation_rad)
+                self.logger.info(f"FOV {fov} {current_name}: aligned (tx={tx:.1f}, ty={ty:.1f}, rot={rotation_deg:.2f}°)")
             
             results['aligned'] += 1
 
@@ -336,3 +462,80 @@ class AlignmentProcessor(BaseProcessor):
             img = cv2.imread(str(f), cv2.IMREAD_ANYDEPTH)
             if img is not None:
                 Image.fromarray(img).save(str(dst_dir / f.name))
+
+    def _output_zeros(self, files: List[Path], dst_dir: Path):
+        """Output black (zero) images for failed alignment"""
+        for f in files:
+            img = cv2.imread(str(f), cv2.IMREAD_ANYDEPTH)
+            if img is not None:
+                zeros = np.zeros_like(img)
+                Image.fromarray(zeros).save(str(dst_dir / f.name))
+
+    def _apply_final_crop(self, output_dir: Path):
+        """
+        Apply uniform crop to all aligned images.
+        
+        Calculates crop margin based on config (fixed value or 'auto'),
+        validates against tile_overlap, and crops all saved images.
+        """
+        if not self._collected_matrices:
+            self.logger.warning("No alignment matrices collected, skipping crop")
+            return
+        
+        if self._img_shape is None:
+            self.logger.warning("Image shape unknown, skipping crop")
+            return
+        
+        h, w = self._img_shape
+        max_allowed = int(min(h, w) * self.tile_overlap)
+        is_auto = str(self.crop_margin).lower() == 'auto'
+        
+        if is_auto:
+            # Smart detection: find max shift across all FOV × all Cycle
+            max_shift = 0.0
+            for fov_data in self._collected_matrices.values():
+                for matrix in fov_data.values():
+                    max_shift = max(max_shift, abs(matrix[0, 2]), abs(matrix[1, 2]))
+            
+            # Apply 1.2x safety factor (covers rotation, subpixel errors)
+            raw_margin = int(np.ceil(max_shift * 1.2))
+            
+            if raw_margin > max_allowed:
+                self.logger.warning(
+                    f"Computed margin {raw_margin}px exceeds max allowed {max_allowed}px "
+                    f"(tile_overlap={self.tile_overlap}). Using {max_allowed}px."
+                )
+                margin = max_allowed
+            else:
+                margin = raw_margin
+            
+            self.logger.info(f"Auto crop: max_shift={max_shift:.1f}px -> margin={margin}px")
+        else:
+            # Manual mode
+            margin = int(self.crop_margin)
+            if margin > max_allowed:
+                raise ValueError(
+                    f"crop_margin={margin}px exceeds max allowed={max_allowed}px "
+                    f"(tile_overlap={self.tile_overlap}). "
+                    f"Use --set alignment.crop_margin auto or reduce the value."
+                )
+            self.logger.info(f"Fixed crop margin={margin}px")
+        
+        if margin == 0:
+            self.logger.info("Crop margin is 0, skipping crop")
+            return
+        
+        # Crop all saved images in output directory
+        count = 0
+        for subdir in output_dir.iterdir():
+            if subdir.is_dir() and subdir.name.startswith(('cycle', 'quench')):
+                for img_path in subdir.glob('*.TIF'):
+                    img = cv2.imread(str(img_path), cv2.IMREAD_ANYDEPTH)
+                    if img is None:
+                        continue
+                    cropped = img[margin:-margin, margin:-margin]
+                    Image.fromarray(cropped.astype(np.uint16)).save(str(img_path))
+                    count += 1
+        
+        new_h, new_w = h - 2 * margin, w - 2 * margin
+        self.logger.info(f"Cropped {count} images: {w}x{h} -> {new_w}x{new_h}")

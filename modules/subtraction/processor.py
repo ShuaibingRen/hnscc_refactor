@@ -121,6 +121,8 @@ class QuenchSubtractor(BaseProcessor):
         self.channels_per_cycle = config.get('input.channels_per_cycle', 4)
         # DAPI channel (w1) should not be subtracted - used for alignment reference
         self.dapi_channel = config.get('alignment.reference_channel', 1)
+        # Failed FOVs from alignment (quench failures affect corresponding cycles)
+        self._failed_cycle_fovs: Dict[int, set] = {}  # cycle_num -> set of failed fov numbers
     
     def process(self, input_dir: Path, output_dir: Path, **kwargs) -> Dict[str, Any]:
         """
@@ -145,8 +147,12 @@ class QuenchSubtractor(BaseProcessor):
             'processed_pairs': 0,
             'processed_images': 0,
             'optimal_coefficients': {},
-            'errors': []
+            'errors': [],
+            'zeroed_fovs': 0
         }
+        
+        # Load alignment report to check for failed quenches
+        self._load_alignment_report(input_dir)
         
         # Process each subtraction pair
         for cycle_num, bg_name in self.SUBTRACTION_PAIRS.items():
@@ -175,7 +181,7 @@ class QuenchSubtractor(BaseProcessor):
             pair_result = self._process_pair(
                 fg_dir, bg_dir, 
                 output_dir / cycle_name,
-                cycle_name, bg_name
+                cycle_name, bg_name, cycle_num
             )
             
             results['processed_pairs'] += 1
@@ -208,14 +214,57 @@ class QuenchSubtractor(BaseProcessor):
             'stats': results
         }
     
+    def _load_alignment_report(self, input_dir: Path):
+        """
+        Load alignment_report.json and identify failed quench FOVs.
+        
+        If a quench alignment failed, the corresponding cycle should output zeros.
+        """
+        report_path = input_dir / 'alignment_report.json'
+        if not report_path.exists():
+            self.logger.debug("No alignment_report.json found, skipping failed FOV check")
+            return
+        
+        with open(report_path) as f:
+            report = json.load(f)
+        
+        failed_fovs = report.get('failed_fovs', [])
+        
+        for item in failed_fovs:
+            fov = item.get('fov')
+            cycle_name = item.get('cycle', '')
+            
+            # Check if it's a quench failure
+            if 'quench' in cycle_name:
+                quench_num = int(cycle_name.replace('quench', ''))
+                # quench N failure affects cycle N+1
+                # According to SUBTRACTION_PAIRS: cycle2 - quench1, cycle3 - quench2, etc.
+                affected_cycle = quench_num + 1
+                
+                if affected_cycle not in self._failed_cycle_fovs:
+                    self._failed_cycle_fovs[affected_cycle] = set()
+                self._failed_cycle_fovs[affected_cycle].add(fov)
+                
+                self.logger.info(f"Quench{quench_num} FOV {fov} failed -> cycle{affected_cycle} FOV {fov} will be zeroed")
+            
+            # Check if it's a cycle failure (cycle itself failed)
+            elif 'cycle' in cycle_name:
+                cycle_num = int(cycle_name.replace('cycle', ''))
+                if cycle_num not in self._failed_cycle_fovs:
+                    self._failed_cycle_fovs[cycle_num] = set()
+                self._failed_cycle_fovs[cycle_num].add(fov)
+    
     def _process_pair(self, fg_dir: Path, bg_dir: Path,
-                      output_dir: Path, fg_name: str, bg_name: str) -> Dict:
+                      output_dir: Path, fg_name: str, bg_name: str, cycle_num: int) -> Dict:
         """Process a single foreground-background pair"""
         output_dir = self._ensure_dir(output_dir)
         
         self.logger.info(f"  Processing {fg_name} - {bg_name}...")
         
-        result = {'images': 0, 'coefficients': {}}
+        result = {'images': 0, 'coefficients': {}, 'zeroed': 0}
+        
+        # Get failed FOVs for this cycle
+        failed_fovs = self._failed_cycle_fovs.get(cycle_num, set())
         
         # Get file mapping
         fg_files = sorted(fg_dir.glob('*.TIF'))
@@ -300,6 +349,17 @@ class QuenchSubtractor(BaseProcessor):
             
             # 2. Apply Subtraction
             for fg_file, parsed in file_list:
+                fov = parsed['fov']
+                
+                # Check if this FOV should be zeroed (alignment failed)
+                if fov in failed_fovs:
+                    img = cv2.imread(str(fg_file), cv2.IMREAD_ANYDEPTH)
+                    if img is not None:
+                        zeros = np.zeros_like(img)
+                        Image.fromarray(zeros).save(str(output_dir / fg_file.name))
+                        result['zeroed'] += 1
+                    continue
+                
                 # DAPI: Copy as-is
                 if channel == self.dapi_channel:
                     img = cv2.imread(str(fg_file), cv2.IMREAD_ANYDEPTH)

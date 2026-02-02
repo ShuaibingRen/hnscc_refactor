@@ -24,11 +24,16 @@ illumination:
 alignment:
   scale: 0.1  # Downscale factor for alignment (speed optimization)
   mean_threshold: 200  # Minimum mean intensity threshold
-  overlap_threshold: 0.2  # Minimum overlap ratio after alignment
+  # overlap_threshold: 0.2  # DEPRECATED: now covered by tile_overlap shift check
   reference_channel: 1  # w1 (DAPI) as reference
   max_iterations: 5000
   epsilon: 1e-10
-  on_failure: skip  # 'skip' = drop failed tiles, 'copy' = keep unaligned tiles
+  pc_fallback: true  # Try Phase Correlation if ECC fails
+  pc_min_response: 0.3  # Minimum PC response threshold
+  on_failure: zero  # 'zero' = output black image, 'copy' = keep unaligned
+  verbose: false  # Print warp matrix (tx, ty, rot) for each FOV
+  crop_margin: 50  # Crop margin in pixels. Set to 'auto' for smart detection
+  tile_overlap: 0.1  # Tile overlap ratio (e.g., 0.1 = 10%), used for crop validation
 
 # Quench subtraction
 subtraction:
@@ -48,7 +53,7 @@ stitching:
 
 # Performance
 performance:
-  max_workers: null  # null = use all available CPUs
+  max_workers: 24  # null = use all available CPUs
   chunk_size: 1000  # MB per chunk for large images
 
 # Output

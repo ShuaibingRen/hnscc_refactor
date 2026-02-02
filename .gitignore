@@ -1,4 +1,10 @@
 __pycache__/
+*/__pycache__/
+*/*/__pycache__/
 *.pyc
 .env
 .DS_Store
+tests/
+scripts/
+configs/
+*.code-workspace
