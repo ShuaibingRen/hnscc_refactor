@@ -32,7 +32,7 @@ alignment:
   pc_min_response: 0.3  # Minimum PC response threshold
   on_failure: zero  # 'zero' = output black image, 'copy' = keep unaligned
   verbose: false  # Print warp matrix (tx, ty, rot) for each FOV
-  crop_margin: 50  # Crop margin in pixels. Set to 'auto' for smart detection
+  crop_margin: auto  # Crop margin in pixels. Set to 'auto' for smart detection
   tile_overlap: 0.1  # Tile overlap ratio (e.g., 0.1 = 10%), used for crop validation
 
 # Quench subtraction

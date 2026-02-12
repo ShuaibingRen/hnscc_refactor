@@ -146,7 +146,7 @@ def get_files_for_cycle(cycle_dir: Path, channel: int = None, exclude_overview: 
         List of file paths, sorted by FOV number
     """
     pattern = f'*_w{channel}_*.TIF' if channel else '*.TIF'
-    files = list(cycle_dir.glob(pattern))
+    files = [f for f in cycle_dir.glob(pattern) if not f.name.startswith('._')]
     
     if exclude_overview and files:
         # Find and exclude max FOV number
